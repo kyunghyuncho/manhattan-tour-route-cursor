@@ -106,6 +106,8 @@ The policy uses a shared **pointer-style decoder** (context query vs.\ per-node 
 - **`RoutingAttentionModel`:** `nn.TransformerEncoder` over the sequence of landmark embeddings.
 - **`RoutingGRUModel`:** `nn.GRU` over the same coordinate sequence (order is the landmark list in the UI), then the same decoder head.
 
+**Weight initialization (explicit in code):** pointer `Linear` layers use **Xavier uniform** (input projection includes zero bias); inside the Transformer encoder, every **`nn.Linear`** is re-initialized the same way while **LayerNorm** keeps PyTorch defaults. GRU uses **Xavier uniform** on input-to-hidden weights, **orthogonal** on hidden-to-hidden weights, and **zero** biases—replacing PyTorch’s uniform `1/\sqrt{\text{hidden\_size}}` default on all GRU parameters, which is often brittle for deeper stacks.
+
 ### 4.1 Encoder
 
 Given coordinate matrix \(X \in \mathbb{R}^{N\times 2}\):
@@ -160,22 +162,19 @@ For map display, greedy decoding uses \(\arg\max_i u_{t,i}^*\).
 
 ---
 
-## 5) Optimization: REINFORCE with Greedy Self-Baseline
+## 5) Optimization: REINFORCE
 
 Training is implemented in `RoutingLightningModule.training_step`.
 
 For one update:
 1. Sample \(K\) full sequences from \(\pi_\theta\) and collect \(\log \pi_\theta(A_t|S_t)\).
 2. Compute per-trajectory rewards \(r^{(i)} = -\mathrm{length}(\mathrm{tour}_i)\) from the cached distance matrix.
-3. Run a **greedy** decode from the same \(\theta\) on the same coordinates to obtain \(r_{\mathrm{greedy}}(\theta)\) (computed under `torch.no_grad()` so it acts only as a baseline signal).
-4. Advantage \(\hat{A}^{(i)} = r^{(i)} - r_{\mathrm{greedy}}(\theta)\).
-5. REINFORCE loss (macro-action factorization):
+3. Advantage \(\hat{A}^{(i)} = (r^{(i)} - \mathrm{mean}(r)) / \mathrm{std}(r) \).
+4. REINFORCE loss (macro-action factorization):
 \[
 \mathcal{L}(\theta)= -\frac{1}{K}\sum_{i=1}^{K}\hat{A}^{(i)} \sum_{t=1}^{N}\log\pi_\theta\!\left(A^{(i)}_t\mid S^{(i)}_t\right)
 \]
-6. Add \(-\lambda H(\pi)\) for entropy regularization (sidebar coefficient) and optimize with Adam.
-
-This **greedy self-baseline** correlates strongly with the current policy and typically lowers gradient variance compared to a slow global scalar baseline, at the cost of one extra forward pass per update.
+5. Add \(-\lambda H(\pi)\) for entropy regularization (sidebar coefficient) and optimize with Adam.
 
 ---
 

@@ -344,6 +344,41 @@ def build_subset_graph_cache(
     )
 
 
+def _init_linear_xavier(m: nn.Linear) -> None:
+    nn.init.xavier_uniform_(m.weight)
+    if m.bias is not None:
+        nn.init.zeros_(m.bias)
+
+
+def _init_pointer_projection_linears(
+    input_projection: nn.Linear,
+    query_projection: nn.Linear,
+    key_projection: nn.Linear,
+) -> None:
+    """Shared pointer head: stable fan-in/out for coordinate → embedding and Q/K."""
+    _init_linear_xavier(input_projection)
+    nn.init.xavier_uniform_(query_projection.weight)
+    nn.init.xavier_uniform_(key_projection.weight)
+
+
+def _init_transformer_encoder_linears(encoder: nn.TransformerEncoder) -> None:
+    """Re-init only `nn.Linear` leaves inside the encoder (leave LayerNorm at PyTorch defaults)."""
+    for mod in encoder.modules():
+        if isinstance(mod, nn.Linear):
+            _init_linear_xavier(mod)
+
+
+def _init_gru_weights(gru: nn.GRU) -> None:
+    """Recurrent nets: orthogonal hidden-to-hidden, Xavier input-to-hidden, zero biases."""
+    for name, p in gru.named_parameters():
+        if "weight_ih" in name:
+            nn.init.xavier_uniform_(p)
+        elif "weight_hh" in name:
+            nn.init.orthogonal_(p)
+        elif "bias" in name:
+            nn.init.zeros_(p)
+
+
 class RoutingAttentionModel(nn.Module):
     def __init__(self, embed_dim: int = 128, num_layers: int = 3, nhead: int = 8):
         super().__init__()
@@ -360,6 +395,10 @@ class RoutingAttentionModel(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.query_projection = nn.Linear(embed_dim * 2, embed_dim, bias=False)
         self.key_projection = nn.Linear(embed_dim, embed_dim, bias=False)
+        _init_pointer_projection_linears(
+            self.input_projection, self.query_projection, self.key_projection
+        )
+        _init_transformer_encoder_linears(self.encoder)
 
     def _decode_logits(
         self, node_embeddings: torch.Tensor, visited_mask: torch.Tensor, prev_index: torch.Tensor
@@ -427,6 +466,10 @@ class RoutingGRUModel(nn.Module):
         )
         self.query_projection = nn.Linear(embed_dim * 2, embed_dim, bias=False)
         self.key_projection = nn.Linear(embed_dim, embed_dim, bias=False)
+        _init_pointer_projection_linears(
+            self.input_projection, self.query_projection, self.key_projection
+        )
+        _init_gru_weights(self.gru)
 
     def _decode_logits(
         self, node_embeddings: torch.Tensor, visited_mask: torch.Tensor, prev_index: torch.Tensor
@@ -554,13 +597,8 @@ class RoutingLightningModule(pl.LightningModule):
         reward = -distance
         rollout_entropy = -log_probs.mean()
 
-        # Greedy self-baseline: deterministic rollout under the same θ (no grad through baseline).
-        with torch.no_grad():
-            greedy_actions, _, _ = self.model(self.coords_single, greedy=True)
-            greedy_reward = -self._route_distance(greedy_actions).squeeze(0)
-        advantage = reward - greedy_reward
         # Normalize advantage
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-9)
+        advantage = (reward - reward.mean()) / (reward.std() + 1e-9)
 
         policy_loss = -(advantage.detach() * log_probs.sum(dim=1)).mean()
         loss = policy_loss - self.entropy_coef * trajectory_entropy.mean()
@@ -1014,7 +1052,7 @@ def main():
 
     with st.sidebar:
         st.header("Macro-Action Routing Configuration")
-        city_name = st.selectbox("City", options=list(CITY_CONFIGS.keys()), index=0)
+        city_name = st.selectbox("City", options=list(CITY_CONFIGS.keys()), index=2)
         city_config = CITY_CONFIGS[city_name]
         city_landmarks = city_config["landmarks"]
         city_presets = city_config["presets"]
