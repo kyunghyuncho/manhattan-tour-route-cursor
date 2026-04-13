@@ -1054,7 +1054,7 @@ def main():
         embed_dim = st.selectbox("Embedding Dimension", options=[64, 128, 256], index=1)
         policy_backbone = st.selectbox(
             "Policy backbone",
-            options=["Transformer", "GRU"],
+            options=["GRU", "Transformer", ],
             index=0,
             help="Transformer: set encoder over landmarks. GRU: recurrent encoder over the "
             "coordinate sequence, same pointer decoder head.",
@@ -1073,7 +1073,7 @@ def main():
             "Trajectories per Update", min_value=1, max_value=256, value=64, step=1
         )
         updates_per_epoch = st.number_input(
-            "Updates per Epoch", min_value=1, max_value=100, value=4, step=1
+            "Updates per Epoch", min_value=1, max_value=100, value=1, step=1
         )
         smoothing_window = st.number_input(
             "Chart Smoothing Window", min_value=1, max_value=50, value=8, step=1
@@ -1082,7 +1082,7 @@ def main():
             "Entropy coefficient (regularization)",
             min_value=0.0,
             max_value=1.0,
-            value=0.01,
+            value=0.1,
             step=0.005,
             format="%.4f",
             help="Adds −λ·H(π) to the loss to encourage exploration (higher = more exploration).",
