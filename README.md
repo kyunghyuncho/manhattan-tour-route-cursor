@@ -1,6 +1,6 @@
-# Macro-Action Manhattan Tour Routing (RL + Attention)
+# Macro-Action City Tour Routing (RL + Attention)
 
-This project is a pedagogical reinforcement learning app that frames Manhattan walking-tour planning as a sequence decision problem (TSP-style) and optimizes route order with a Transformer-based pointer policy trained by REINFORCE.
+This project is a pedagogical reinforcement learning app that frames city walking-tour planning as a sequence decision problem (TSP-style) and optimizes route order with a Transformer-based pointer policy trained by REINFORCE.
 
 The app combines:
 - **Geospatial realism** from OpenStreetMap (`osmnx` + `networkx`)
@@ -9,17 +9,23 @@ The app combines:
 
 ---
 
-## 1) Problem Framing
+## 1) Problem Framing (Multi-City)
 
-Given a user-selected subset of Manhattan landmarks, the model learns a permutation (visit order) that minimizes total walking distance over the Manhattan street network.
+Given a user-selected subset of landmarks, the model learns a permutation (visit order) that minimizes total walking distance over the real street network of the selected city.
 
 - Input: a set of \(N\) landmarks with 2D coordinates \((\text{lat}, \text{lon})\)
 - Output: an ordered sequence of indices \((A_1, A_2, \dots, A_N)\), where each index appears once
 - Objective: minimize route length (equivalently maximize negative distance reward)
 
-The environment is bounded to Manhattan:
-- Latitude: \([40.7000, 40.8800]\)
-- Longitude: \([-74.0200, -73.9100]\)
+Currently supported city configurations:
+- **Manhattan**
+- **London**
+- **Paris**
+
+Each city provides:
+- its own bounding box for graph extraction
+- its own landmark dictionary
+- city-specific demo presets (`Easy`, `Medium`, `Hard`, `Custom`)
 
 ---
 
@@ -27,12 +33,12 @@ The environment is bounded to Manhattan:
 
 Before RL starts, the app builds a deterministic routing cache for the selected landmarks.
 
-### 2.1 Manhattan walk graph
+### 2.1 City walk graph
 
-Using OSMnx, a walkable graph is downloaded:
+Using OSMnx, a walkable graph is downloaded per city:
 
 \[
-G = \texttt{graph\_from\_bbox}(\text{bbox}=(-74.0200,\ 40.7000,\ -73.9100,\ 40.8800),\ \text{network\_type}=\text{"walk"})
+G = \texttt{graph\_from\_bbox}(\text{bbox}=\text{city\_bbox},\ \text{network\_type}=\text{"walk"})
 \]
 
 ### 2.2 Landmark-to-node projection
@@ -176,7 +182,11 @@ This baseline reduces gradient variance while preserving unbiased policy-gradien
 ## 6) Streamlit Interface Behavior
 
 ### Sidebar
+- City selector (`Manhattan`, `London`, `Paris`)
 - Landmark multiselect (minimum 3)
+- Shuffle button for selected landmark order
+- Teaching Mode toggle
+- Scenario preset selector (`Custom`, `Easy`, `Medium`, `Hard`) per city
 - Embedding dimension (`64`, `128`, `256`)
 - Transformer layers (`1` to `6`)
 - Learning rate
@@ -189,10 +199,18 @@ This baseline reduces gradient variance while preserving unbiased policy-gradien
   - Best Total Route Distance (meters)
   - Current Policy Loss
 - Progress chart:
-  - **Episodic reward curve** per epoch (higher is better)
+  - Standard mode: sampled reward + greedy-eval reward
+  - Teaching mode: sampled reward, greedy reward, greedy regret (meters), entropy proxy
+- Baseline comparison table:
+  - random
+  - nearest neighbor (`start=0`)
+  - untrained greedy
+  - exact optimal (for \(N \le 9\), otherwise skipped)
+  - trained greedy (added after optimization)
 - Folium map:
   - Landmarks shown with numbered markers
   - Marker numbers correspond to **visit order**
+  - Marker popup includes image, short description, and Wikipedia link
   - Route segments drawn from `PATH_CACHE` as red street-following polylines
   - Final optimized route is always rendered when training ends
 
@@ -238,6 +256,7 @@ streamlit run app.py
 - **Important decoding caveat:** greedy decoding uses `torch.argmax` on logits. If multiple logits are tied (or numerically near-tied), `argmax` selects the first maximal index. This deterministic tie-breaking can introduce an index-order bias.
 - If selected landmarks are already ordered in a geographically sensible sequence (for example, roughly monotonic by latitude/longitude), first-index tie-breaking can produce a surprisingly good untrained greedy route. This can make "epoch 0" look better than expected even without meaningful learning.
 - For demonstrations, use shuffled landmark order, baseline comparisons (random / nearest-neighbor / untrained / trained), and optimality-gap reporting to avoid over-attributing improvements to RL.
+- In Teaching Mode, focus on **regret** and **baseline gaps** rather than only raw sampled reward, because REINFORCE reward traces are high-variance.
 
 ---
 
@@ -246,3 +265,15 @@ streamlit run app.py
 - `app.py`: full app (data, model, training loop, UI, map rendering)
 - `PLAN.md`: implementation specification
 - `requirements.txt`: runtime dependencies
+
+---
+
+## 11) Notes on Wikipedia Popups
+
+- Landmark popups query Wikipedia summary API and are cached for 24 hours.
+- Popups attempt to show:
+  - thumbnail image
+  - short encyclopedic extract
+  - direct Wikipedia page link
+- For ambiguous names, city-specific title overrides are used.
+- If lookup fails, the popup falls back to a safe text + link template.

@@ -3,6 +3,7 @@ import random
 import time
 from itertools import permutations
 from dataclasses import dataclass
+from urllib.parse import quote
 from typing import Dict, List, Tuple
 
 import folium
@@ -11,6 +12,7 @@ import numpy as np
 import osmnx as ox
 import pandas as pd
 import pytorch_lightning as pl
+import requests
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -20,64 +22,224 @@ from torch.distributions import Categorical
 from torch.utils.data import DataLoader, Dataset
 
 
-LANDMARKS: Dict[str, Tuple[float, float]] = {
-    "One World Trade Center": (40.7127, -74.0134),
-    "Central Park (Center)": (40.7812, -73.9665),
-    "The Metropolitan Museum of Art": (40.7794, -73.9632),
-    "The Cloisters": (40.8649, -73.9317),
-    "Bryant Park": (40.7536, -73.9832),
-    "New York Public Library": (40.7532, -73.9822),
-    "Columbia University": (40.8075, -73.9626),
-    "New York University": (40.7295, -73.9965),
-    "Hudson Yards": (40.7527, -74.0003),
-    "Battery Park": (40.7033, -74.0170),
-    "United Nations Headquarters": (40.7489, -73.9680),
-    "Empire State Building": (40.7484, -73.9857),
-    "Times Square": (40.7580, -73.9855),
-    "Grand Central Terminal": (40.7527, -73.9772),
-    "Rockefeller Center": (40.7587, -73.9787),
-    "Museum of Modern Art (MoMA)": (40.7614, -73.9776),
-    "The High Line": (40.7476, -74.0048),
-    "Chelsea Market": (40.7426, -74.0060),
-    "Flatiron Building": (40.7411, -73.9897),
-    "Washington Square Park": (40.7308, -73.9973),
-    "Solomon R. Guggenheim Museum": (40.7830, -73.9590),
-    "St. Patrick's Cathedral": (40.7585, -73.9760),
-    "Madison Square Garden": (40.7505, -73.9934),
-    "New York Stock Exchange": (40.7069, -74.0113),
-    "Charging Bull": (40.7060, -74.0132),
-}
-
-SCENARIO_PRESETS: Dict[str, List[str]] = {
-    "Custom": [],
-    "Easy (3 landmarks)": ["Battery Park", "Times Square", "The Cloisters"],
-    "Medium (6 landmarks)": [
-        "Charging Bull",
-        "Washington Square Park",
-        "Bryant Park",
-        "Central Park (Center)",
-        "Columbia University",
-        "The Cloisters",
-    ],
-    "Hard (8 landmarks)": [
-        "Battery Park",
-        "New York University",
-        "Flatiron Building",
-        "Grand Central Terminal",
-        "Rockefeller Center",
-        "Central Park (Center)",
-        "Columbia University",
-        "The Cloisters",
-    ],
+CITY_CONFIGS = {
+    "Manhattan": {
+        "bbox": (-74.0200, 40.7000, -73.9100, 40.8800),
+        "landmarks": {
+            "One World Trade Center": (40.7127, -74.0134),
+            "Central Park (Center)": (40.7812, -73.9665),
+            "The Metropolitan Museum of Art": (40.7794, -73.9632),
+            "The Cloisters": (40.8649, -73.9317),
+            "Bryant Park": (40.7536, -73.9832),
+            "New York Public Library": (40.7532, -73.9822),
+            "Columbia University": (40.8075, -73.9626),
+            "New York University": (40.7295, -73.9965),
+            "Hudson Yards": (40.7527, -74.0003),
+            "Battery Park": (40.7033, -74.0170),
+            "United Nations Headquarters": (40.7489, -73.9680),
+            "Empire State Building": (40.7484, -73.9857),
+            "Times Square": (40.7580, -73.9855),
+            "Grand Central Terminal": (40.7527, -73.9772),
+            "Rockefeller Center": (40.7587, -73.9787),
+            "Museum of Modern Art (MoMA)": (40.7614, -73.9776),
+            "The High Line": (40.7476, -74.0048),
+            "Chelsea Market": (40.7426, -74.0060),
+            "Flatiron Building": (40.7411, -73.9897),
+            "Washington Square Park": (40.7308, -73.9973),
+            "Solomon R. Guggenheim Museum": (40.7830, -73.9590),
+            "St. Patrick's Cathedral": (40.7585, -73.9760),
+            "Madison Square Garden": (40.7505, -73.9934),
+            "New York Stock Exchange": (40.7069, -74.0113),
+            "Charging Bull": (40.7060, -74.0132),
+        },
+        "presets": {
+            "Custom": [],
+            "Easy (3 landmarks)": ["Battery Park", "Times Square", "The Cloisters"],
+            "Medium (6 landmarks)": [
+                "Charging Bull",
+                "Washington Square Park",
+                "Bryant Park",
+                "Central Park (Center)",
+                "Columbia University",
+                "The Cloisters",
+            ],
+            "Hard (8 landmarks)": [
+                "Battery Park",
+                "New York University",
+                "Flatiron Building",
+                "Grand Central Terminal",
+                "Rockefeller Center",
+                "Central Park (Center)",
+                "Columbia University",
+                "The Cloisters",
+            ],
+        },
+    },
+    "London": {
+        "bbox": (-0.2650, 51.4700, 0.0200, 51.5600),
+        "landmarks": {
+            "Buckingham Palace": (51.5014, -0.1419),
+            "Big Ben": (51.5007, -0.1246),
+            "Westminster Abbey": (51.4993, -0.1273),
+            "London Eye": (51.5033, -0.1196),
+            "Trafalgar Square": (51.5080, -0.1281),
+            "The British Museum": (51.5194, -0.1270),
+            "St Paul's Cathedral": (51.5138, -0.0984),
+            "Tower of London": (51.5081, -0.0759),
+            "Tower Bridge": (51.5055, -0.0754),
+            "Borough Market": (51.5055, -0.0910),
+            "Hyde Park Corner": (51.5022, -0.1527),
+            "Camden Market": (51.5415, -0.1460),
+            "King's Cross Station": (51.5308, -0.1238),
+            "Covent Garden": (51.5118, -0.1230),
+        },
+        "presets": {
+            "Custom": [],
+            "Easy (3 landmarks)": ["Big Ben", "Trafalgar Square", "The British Museum"],
+            "Medium (6 landmarks)": [
+                "Buckingham Palace",
+                "Big Ben",
+                "Covent Garden",
+                "St Paul's Cathedral",
+                "Tower Bridge",
+                "Camden Market",
+            ],
+            "Hard (8 landmarks)": [
+                "Hyde Park Corner",
+                "Buckingham Palace",
+                "London Eye",
+                "The British Museum",
+                "King's Cross Station",
+                "St Paul's Cathedral",
+                "Tower of London",
+                "Borough Market",
+            ],
+        },
+    },
+    "Paris": {
+        "bbox": (2.2240, 48.8150, 2.4200, 48.9020),
+        "landmarks": {
+            "Eiffel Tower": (48.8584, 2.2945),
+            "Louvre Museum": (48.8606, 2.3376),
+            "Notre-Dame Cathedral": (48.8530, 2.3499),
+            "Arc de Triomphe": (48.8738, 2.2950),
+            "Champs-Elysees": (48.8698, 2.3078),
+            "Sacre-Coeur": (48.8867, 2.3431),
+            "Montparnasse Tower": (48.8422, 2.3211),
+            "Luxembourg Gardens": (48.8462, 2.3372),
+            "Place de la Concorde": (48.8656, 2.3212),
+            "Musee d'Orsay": (48.8600, 2.3266),
+            "Centre Pompidou": (48.8606, 2.3522),
+            "Pantheon": (48.8462, 2.3459),
+            "Gare du Nord": (48.8809, 2.3553),
+            "Bastille": (48.8530, 2.3690),
+        },
+        "presets": {
+            "Custom": [],
+            "Easy (3 landmarks)": ["Eiffel Tower", "Louvre Museum", "Notre-Dame Cathedral"],
+            "Medium (6 landmarks)": [
+                "Arc de Triomphe",
+                "Champs-Elysees",
+                "Place de la Concorde",
+                "Louvre Museum",
+                "Notre-Dame Cathedral",
+                "Bastille",
+            ],
+            "Hard (8 landmarks)": [
+                "Montparnasse Tower",
+                "Luxembourg Gardens",
+                "Pantheon",
+                "Notre-Dame Cathedral",
+                "Centre Pompidou",
+                "Gare du Nord",
+                "Sacre-Coeur",
+                "Arc de Triomphe",
+            ],
+        },
+    },
 }
 
 
 @dataclass
 class SubsetGraphCache:
+    city_name: str
     selected_names: List[str]
     selected_coords: np.ndarray
     distance_matrix: np.ndarray
     path_cache: Dict[Tuple[int, int], List[Tuple[float, float]]]
+
+
+WIKIPEDIA_TITLE_OVERRIDES = {
+    "Manhattan": {
+        "Central Park (Center)": "Central Park",
+        "The Metropolitan Museum of Art": "Metropolitan Museum of Art",
+        "Museum of Modern Art (MoMA)": "Museum of Modern Art",
+        "The High Line": "High Line",
+        "New York Public Library": "New York Public Library Main Branch",
+    },
+    "London": {
+        "Big Ben": "Big Ben",
+        "Borough Market": "Borough Market",
+        "King's Cross Station": "King's Cross railway station",
+    },
+    "Paris": {
+        "Sacre-Coeur": "Sacré-Cœur, Paris",
+        "Bastille": "Place de la Bastille",
+    },
+}
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def fetch_wikipedia_summary(city_name: str, landmark_name: str):
+    query_title = WIKIPEDIA_TITLE_OVERRIDES.get(city_name, {}).get(landmark_name, landmark_name)
+    query_title = query_title.replace("(", "").replace(")", "")
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(query_title, safe='')}"
+
+    try:
+        response = requests.get(url, timeout=6)
+        if response.status_code != 200:
+            return {
+                "title": landmark_name,
+                "description": f"No Wikipedia summary found for {landmark_name}.",
+                "link": f"https://en.wikipedia.org/wiki/{quote(query_title.replace(' ', '_'), safe='')}",
+                "image_url": None,
+            }
+        data = response.json()
+        return {
+            "title": data.get("title", landmark_name),
+            "description": data.get("extract", f"No description available for {landmark_name}."),
+            "link": data.get(
+                "content_urls", {}
+            ).get("desktop", {}).get(
+                "page", f"https://en.wikipedia.org/wiki/{quote(query_title.replace(' ', '_'), safe='')}"
+            ),
+            "image_url": data.get("thumbnail", {}).get("source"),
+        }
+    except requests.RequestException:
+        return {
+            "title": landmark_name,
+            "description": "Wikipedia information is currently unavailable.",
+            "link": f"https://en.wikipedia.org/wiki/{quote(query_title.replace(' ', '_'), safe='')}",
+            "image_url": None,
+        }
+
+
+def build_landmark_popup_html(city_name: str, landmark_name: str, visit_number: int) -> str:
+    info = fetch_wikipedia_summary(city_name, landmark_name)
+    img_html = ""
+    if info["image_url"]:
+        img_html = (
+            f"<img src='{info['image_url']}' style='width:100%;max-width:260px;border-radius:8px;"
+            "margin-bottom:8px;'/>"
+        )
+    return (
+        "<div style='width:280px;font-family:Arial,sans-serif;'>"
+        f"<h4 style='margin:0 0 8px 0;'>Visit {visit_number}: {landmark_name}</h4>"
+        f"{img_html}"
+        f"<p style='font-size:13px;line-height:1.35;margin:0 0 8px 0;'>{info['description']}</p>"
+        f"<a href='{info['link']}' target='_blank'>Read on Wikipedia</a>"
+        "</div>"
+    )
 
 
 def route_distance_for_sequence(distance_matrix: np.ndarray, sequence: List[int]) -> float:
@@ -119,18 +281,23 @@ def brute_force_optimal_sequence(distance_matrix: np.ndarray, max_nodes: int = 9
 
 
 @st.cache_resource(show_spinner=True)
-def load_manhattan_walk_graph():
+def load_city_walk_graph(bbox: Tuple[float, float, float, float]):
     # OSMnx 2.x expects bbox=(left, bottom, right, top).
     return ox.graph_from_bbox(
-        bbox=(-74.0200, 40.7000, -73.9100, 40.8800),
+        bbox=bbox,
         network_type="walk",
     )
 
 
-def build_subset_graph_cache(selected_names: List[str]) -> SubsetGraphCache:
-    graph = load_manhattan_walk_graph()
+def build_subset_graph_cache(
+    city_name: str,
+    selected_names: List[str],
+    city_landmarks: Dict[str, Tuple[float, float]],
+    city_bbox: Tuple[float, float, float, float],
+) -> SubsetGraphCache:
+    graph = load_city_walk_graph(city_bbox)
     projected_graph = ox.project_graph(graph)
-    coords = np.array([LANDMARKS[name] for name in selected_names], dtype=np.float32)
+    coords = np.array([city_landmarks[name] for name in selected_names], dtype=np.float32)
     n = len(selected_names)
 
     node_ids = []
@@ -166,6 +333,7 @@ def build_subset_graph_cache(selected_names: List[str]) -> SubsetGraphCache:
             path_cache[(i, j)] = coordinate_path
 
     return SubsetGraphCache(
+        city_name=city_name,
         selected_names=selected_names,
         selected_coords=coords,
         distance_matrix=distance_matrix,
@@ -340,6 +508,7 @@ class RoutingLightningModule(pl.LightningModule):
 
 
 def render_route_map(
+    city_name: str,
     selected_names: List[str],
     selected_coords: np.ndarray,
     path_cache: Dict[Tuple[int, int], List[Tuple[float, float]]],
@@ -354,9 +523,10 @@ def render_route_map(
     for idx, name in enumerate(selected_names):
         lat, lon = selected_coords[idx]
         visit_number = visit_order.get(idx, "?")
+        popup_html = build_landmark_popup_html(city_name, name, int(visit_number))
         folium.Marker(
             location=[float(lat), float(lon)],
-            popup=f"Visit {visit_number}: {name}",
+            popup=folium.Popup(popup_html, max_width=300),
             tooltip=f"Visit {visit_number}: {name}",
             icon=folium.DivIcon(
                 html=(
@@ -449,6 +619,7 @@ class StreamlitProgressCallback(pl.Callback):
         if epoch_num % self.map_update_interval == 0 or epoch_num == 1:
             greedy_indices = self.module_ref.greedy_sequence()
             fmap = render_route_map(
+                city_name=self.subset_cache.city_name,
                 selected_names=self.subset_cache.selected_names,
                 selected_coords=self.subset_cache.selected_coords,
                 path_cache=self.subset_cache.path_cache,
@@ -466,18 +637,29 @@ class StreamlitProgressCallback(pl.Callback):
 
 
 def main():
-    st.set_page_config(page_title="Macro-Action Manhattan Routing", layout="wide")
+    st.set_page_config(page_title="Macro-Action City Routing", layout="wide")
     st.title("Macro-Action Path Planning via Reinforcement Learning")
 
     with st.sidebar:
         st.header("Macro-Action Routing Configuration")
+        city_name = st.selectbox("City", options=list(CITY_CONFIGS.keys()), index=0)
+        city_config = CITY_CONFIGS[city_name]
+        city_landmarks = city_config["landmarks"]
+        city_presets = city_config["presets"]
+        city_bbox = city_config["bbox"]
         teaching_mode = st.checkbox("Teaching Mode", value=True)
-        preset_name = st.selectbox("Scenario Preset", options=list(SCENARIO_PRESETS.keys()), index=2)
+        preset_name = st.selectbox("Scenario Preset", options=list(city_presets.keys()), index=2)
         default_landmarks = (
-            SCENARIO_PRESETS[preset_name]
-            if SCENARIO_PRESETS[preset_name]
-            else ["Battery Park", "Times Square", "The Cloisters"]
+            city_presets[preset_name]
+            if city_presets[preset_name]
+            else list(city_landmarks.keys())[:3]
         )
+
+        if st.session_state.get("last_city_name") != city_name:
+            st.session_state["selected_names"] = default_landmarks.copy()
+            st.session_state["pending_selected_names"] = default_landmarks.copy()
+            st.session_state["last_preset_name"] = preset_name
+        st.session_state["last_city_name"] = city_name
 
         if "selected_names" not in st.session_state:
             st.session_state["selected_names"] = default_landmarks.copy()
@@ -488,8 +670,8 @@ def main():
         st.session_state["last_preset_name"] = preset_name
 
         selected_names = st.multiselect(
-            "Select Manhattan landmarks (minimum 3):",
-            options=list(LANDMARKS.keys()),
+            f"Select {city_name} landmarks (minimum 3):",
+            options=list(city_landmarks.keys()),
             key="selected_names",
         )
         if st.button("Shuffle Selected Landmarks", disabled=len(selected_names) < 2):
@@ -536,8 +718,13 @@ def main():
         torch.manual_seed(run_seed)
 
         st.info(f"Run seed (time-based): {run_seed}")
-        with st.spinner("Building Manhattan graph cache and training policy..."):
-            subset_cache = build_subset_graph_cache(selected_names)
+        with st.spinner(f"Building {city_name} graph cache and training policy..."):
+            subset_cache = build_subset_graph_cache(
+                city_name=city_name,
+                selected_names=selected_names,
+                city_landmarks=city_landmarks,
+                city_bbox=city_bbox,
+            )
             n_landmarks = len(selected_names)
             rng = random.Random(run_seed)
 
@@ -633,6 +820,7 @@ def main():
             final_distance = route_distance_for_sequence(subset_cache.distance_matrix, final_route_indices)
             final_reward = -final_distance
             final_map = render_route_map(
+                city_name=city_name,
                 selected_names=subset_cache.selected_names,
                 selected_coords=subset_cache.selected_coords,
                 path_cache=subset_cache.path_cache,
