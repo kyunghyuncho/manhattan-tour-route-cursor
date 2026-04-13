@@ -81,13 +81,18 @@ To map abstract sequences to physical routes, the system must implement a cachin
 * **Reward:** The total episode reward $r$ is the negative sum of the distances of the traversed sequence, queried directly from the pre-computed matrix $D$.
   $$r = - \sum_{t=1}^{N-1} D_{A_t, A_{t+1}}$$
 
-## 4. Policy Architecture: Attention Model
+## 4. Policy Architecture: Pointer Model (Transformer or GRU)
 
-The policy $\pi_\theta(A_t | S_t)$ must be implemented as a Transformer-based Pointer Network `RoutingAttentionModel(nn.Module)`.
+The policy $\pi_\theta(A_t | S_t)$ is a pointer-style network. The **encoder** may be either:
+
+* `RoutingAttentionModel(nn.Module)`: `nn.TransformerEncoder` over landmark embeddings, or
+* `RoutingGRUModel(nn.Module)`: `nn.GRU` (stacked layers, batch-first) over the same embedded sequence.
+
+The Streamlit sidebar exposes a toggle to choose between these backbones; the decoder head (context query vs.\ keys) is shared in spirit across both implementations.
 
 ### 4.1 Encoder Structure
 1.  **Linear Projection:** Map each 2D coordinate $l_i$ to an embedding dimension $d$ (default $d=128$).
-2.  **Transformer:** Process the embeddings via a `nn.TransformerEncoder` with multiple multi-head self-attention layers to yield node embeddings $H \in \mathbb{R}^{N \times d}$.
+2.  **Sequence encoder:** Either a `nn.TransformerEncoder` (multi-head self-attention) or a `nn.GRU` over the embedded sequence, yielding node embeddings $H \in \mathbb{R}^{N \times d}$.
 3.  **Global Graph Embedding:** Derive $\bar{h} = \frac{1}{N} \sum_{i=1}^N h_i$.
 
 ### 4.2 Decoder Structure and Masking
@@ -105,9 +110,9 @@ Implement the REINFORCE optimization loop within a `pl.LightningModule`.
 * **Rollout (`training_step`):**
     1.  Execute a forward pass to generate a full permutation sequence of length $N$, collecting actions $A_t$ and log-probabilities $\log \pi_\theta(A_t|S)$.
     2.  Compute the scalar episodic return $r$ using the pre-computed distance matrix $D$.
-* **Baseline Calculation:** Subtract an exponential moving average (EMA) of previous batch returns to reduce gradient variance.
+* **Baseline Calculation:** Subtract a **greedy self-baseline** \(r_{\mathrm{greedy}}(\theta)\): the return from a deterministic greedy decode under the current parameters (no gradient through the baseline term), to reduce gradient variance.
 * **Loss Function:**
-    $$\mathcal{L}(\theta) = - (r - b_{EMA}) \sum_{t=1}^N \log \pi_\theta(A_t | S_t)$$
+    $$\mathcal{L}(\theta) = - (r - r_{\mathrm{greedy}}(\theta)) \sum_{t=1}^N \log \pi_\theta(A_t | S_t)$$
 * **Optimizer:** `torch.optim.Adam`.
 
 ## 6. Streamlit Interface Specification
@@ -119,7 +124,8 @@ Implement `app.py` utilizing the following precise layout constraints.
 * **Landmark Input:** `st.multiselect` populated with the keys of `LANDMARKS`. Enforce a minimum selection of 3 landmarks before enabling execution.
 * **Architecture & Hyperparameters:**
     * Embedding Dimension: `st.selectbox` (options: `64`, `128`, `256`).
-    * Transformer Layers: `st.number_input` (default `3`, min `1`, max `6`).
+    * Policy backbone: `st.selectbox` (`Transformer`, `GRU`).
+    * Encoder depth: `st.number_input` (default `3`, min `1`, max `6`) — Transformer encoder layers or stacked GRU layers.
     * Learning Rate: `st.number_input` (default `1e-3`, format `%.4f`).
 * **Execution Trigger:** `st.button` labeled "Initialize & Train Policy".
 

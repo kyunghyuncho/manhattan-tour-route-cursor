@@ -1,10 +1,13 @@
 import math
+import copy
 import random
+import threading
 import time
+from datetime import timedelta
 from itertools import permutations
 from dataclasses import dataclass
 from urllib.parse import quote
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import folium
 import networkx as nx
@@ -377,17 +380,24 @@ class RoutingAttentionModel(nn.Module):
 
     def forward(
         self, coords: torch.Tensor, greedy: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         node_embeddings = self.encoder(self.input_projection(coords))
         batch_size, num_nodes, _ = node_embeddings.shape
         visited = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=coords.device)
         prev_index = torch.zeros(batch_size, dtype=torch.long, device=coords.device)
-        actions, log_probs = [], []
+        actions, log_probs, step_entropies = [], [], []
 
         for _ in range(num_nodes):
             logits = self._decode_logits(node_embeddings, visited, prev_index)
             dist = Categorical(logits=logits)
-            action = torch.argmax(logits, dim=-1) if greedy else dist.sample()
+            if greedy:
+                action = torch.argmax(logits, dim=-1)
+                step_entropies.append(
+                    torch.zeros(batch_size, device=coords.device, dtype=torch.float32)
+                )
+            else:
+                action = dist.sample()
+                step_entropies.append(dist.entropy())
             action_log_prob = dist.log_prob(action)
             visited_next = visited.clone()
             visited_next[torch.arange(batch_size, device=coords.device), action] = True
@@ -396,12 +406,82 @@ class RoutingAttentionModel(nn.Module):
             actions.append(action)
             log_probs.append(action_log_prob)
 
-        return torch.stack(actions, dim=1), torch.stack(log_probs, dim=1)
+        trajectory_entropy = torch.stack(step_entropies, dim=1).sum(dim=1)
+        return torch.stack(actions, dim=1), torch.stack(log_probs, dim=1), trajectory_entropy
 
 
-class _SingleInstanceDataset(Dataset):
+class RoutingGRUModel(nn.Module):
+    """Sequence encoder (GRU over landmark coordinates) + pointer-style decoder head."""
+
+    def __init__(self, embed_dim: int = 128, num_layers: int = 3):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.input_projection = nn.Linear(2, embed_dim)
+        nl = max(1, int(num_layers))
+        self.gru = nn.GRU(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            num_layers=nl,
+            batch_first=True,
+            dropout=0.0,
+        )
+        self.query_projection = nn.Linear(embed_dim * 2, embed_dim, bias=False)
+        self.key_projection = nn.Linear(embed_dim, embed_dim, bias=False)
+
+    def _decode_logits(
+        self, node_embeddings: torch.Tensor, visited_mask: torch.Tensor, prev_index: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size, _, _ = node_embeddings.shape
+        graph_embedding = node_embeddings.mean(dim=1)
+        prev_embedding = node_embeddings[
+            torch.arange(batch_size, device=node_embeddings.device), prev_index
+        ]
+        context = torch.cat([graph_embedding, prev_embedding], dim=-1)
+        query = self.query_projection(context)
+        keys = self.key_projection(node_embeddings)
+        logits = torch.einsum("bd,bnd->bn", query, keys) / math.sqrt(self.embed_dim)
+        logits = logits.masked_fill(visited_mask.clone(), float("-inf"))
+        return logits
+
+    def forward(
+        self, coords: torch.Tensor, greedy: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.input_projection(coords)
+        node_embeddings, _ = self.gru(x)
+        batch_size, num_nodes, _ = node_embeddings.shape
+        visited = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=coords.device)
+        prev_index = torch.zeros(batch_size, dtype=torch.long, device=coords.device)
+        actions, log_probs, step_entropies = [], [], []
+
+        for _ in range(num_nodes):
+            logits = self._decode_logits(node_embeddings, visited, prev_index)
+            dist = Categorical(logits=logits)
+            if greedy:
+                action = torch.argmax(logits, dim=-1)
+                step_entropies.append(
+                    torch.zeros(batch_size, device=coords.device, dtype=torch.float32)
+                )
+            else:
+                action = dist.sample()
+                step_entropies.append(dist.entropy())
+            action_log_prob = dist.log_prob(action)
+            visited_next = visited.clone()
+            visited_next[torch.arange(batch_size, device=coords.device), action] = True
+            visited = visited_next
+            prev_index = action
+            actions.append(action)
+            log_probs.append(action_log_prob)
+
+        trajectory_entropy = torch.stack(step_entropies, dim=1).sum(dim=1)
+        return torch.stack(actions, dim=1), torch.stack(log_probs, dim=1), trajectory_entropy
+
+
+class _FixedLengthDataset(Dataset):
+    def __init__(self, length: int):
+        self.length = max(1, int(length))
+
     def __len__(self):
-        return 1
+        return self.length
 
     def __getitem__(self, idx):
         return torch.tensor(0, dtype=torch.long)
@@ -415,23 +495,27 @@ class RoutingLightningModule(pl.LightningModule):
         embed_dim: int,
         num_layers: int,
         learning_rate: float,
-        ema_beta: float = 0.9,
+        trajectories_per_update: int = 16,
+        entropy_coef: float = 0.01,
+        policy_backbone: Literal["transformer", "gru"] = "transformer",
     ):
         super().__init__()
-        self.model = RoutingAttentionModel(embed_dim=embed_dim, num_layers=num_layers)
+        if policy_backbone == "gru":
+            self.model = RoutingGRUModel(embed_dim=embed_dim, num_layers=num_layers)
+        else:
+            self.model = RoutingAttentionModel(embed_dim=embed_dim, num_layers=num_layers)
         self.learning_rate = learning_rate
-        self.ema_beta = ema_beta
-        self.ema_baseline = None
+        self.trajectories_per_update = max(1, int(trajectories_per_update))
+        self.entropy_coef = float(entropy_coef)
         self.save_hyperparameters(ignore=["coords", "distance_matrix"])
 
-        self.register_buffer("coords", torch.tensor(coords, dtype=torch.float32).unsqueeze(0))
+        self.register_buffer("coords_single", torch.tensor(coords, dtype=torch.float32).unsqueeze(0))
         self.register_buffer("dist_mat", torch.tensor(distance_matrix, dtype=torch.float32))
 
         self.distance_history: List[float] = []
         self.reward_history: List[float] = []
         self.greedy_eval_distance_history: List[float] = []
         self.greedy_eval_reward_history: List[float] = []
-        self.regret_history: List[float] = []
         self.entropy_history: List[float] = []
         self.loss_history: List[float] = []
         self.best_distance = float("inf")
@@ -444,6 +528,17 @@ class RoutingLightningModule(pl.LightningModule):
         self.latest_greedy_eval_distance = float("inf")
         self.latest_greedy_eval_reward = float("-inf")
         self.latest_entropy = 0.0
+        self.best_policy_state_dict = None
+        self._epoch_distance_samples: List[float] = []
+        self._epoch_reward_samples: List[float] = []
+        self._epoch_loss_samples: List[float] = []
+        self._epoch_entropy_samples: List[float] = []
+
+    def on_train_epoch_start(self):
+        self._epoch_distance_samples.clear()
+        self._epoch_reward_samples.clear()
+        self._epoch_loss_samples.clear()
+        self._epoch_entropy_samples.clear()
 
     def _route_distance(self, actions: torch.Tensor) -> torch.Tensor:
         from_idx = actions[:, :-1]
@@ -453,31 +548,30 @@ class RoutingLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         del batch, batch_idx
-        actions, log_probs = self.model(self.coords, greedy=False)
+        coords_batch = self.coords_single.repeat(self.trajectories_per_update, 1, 1)
+        actions, log_probs, trajectory_entropy = self.model(coords_batch, greedy=False)
         distance = self._route_distance(actions)
         reward = -distance
-        reward_mean = reward.mean().detach()
         rollout_entropy = -log_probs.mean()
 
-        if self.ema_baseline is None:
-            self.ema_baseline = reward_mean
-        else:
-            self.ema_baseline = (
-                self.ema_beta * self.ema_baseline + (1.0 - self.ema_beta) * reward_mean
-            )
-        advantage = reward - self.ema_baseline
+        # Greedy self-baseline: deterministic rollout under the same θ (no grad through baseline).
+        with torch.no_grad():
+            greedy_actions, _, _ = self.model(self.coords_single, greedy=True)
+            greedy_reward = -self._route_distance(greedy_actions).squeeze(0)
+        advantage = reward - greedy_reward
+        # Normalize advantage
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-9)
 
-        loss = -(advantage.detach() * log_probs.sum(dim=1)).mean()
+        policy_loss = -(advantage.detach() * log_probs.sum(dim=1)).mean()
+        loss = policy_loss - self.entropy_coef * trajectory_entropy.mean()
         self.latest_loss = float(loss.detach().cpu().item())
         self.latest_distance = float(distance.detach().mean().cpu().item())
         self.latest_reward = float(reward.detach().mean().cpu().item())
         self.latest_entropy = float(rollout_entropy.detach().cpu().item())
-        self.best_distance = min(self.best_distance, self.latest_distance)
-        self.best_reward = max(self.best_reward, self.latest_reward)
-        self.distance_history.append(self.latest_distance)
-        self.reward_history.append(self.latest_reward)
-        self.entropy_history.append(self.latest_entropy)
-        self.loss_history.append(self.latest_loss)
+        self._epoch_distance_samples.append(self.latest_distance)
+        self._epoch_reward_samples.append(self.latest_reward)
+        self._epoch_entropy_samples.append(self.latest_entropy)
+        self._epoch_loss_samples.append(self.latest_loss)
 
         self.log("policy_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
         self.log(
@@ -489,19 +583,41 @@ class RoutingLightningModule(pl.LightningModule):
         )
         return loss
 
+    def on_train_epoch_end(self):
+        if not self._epoch_distance_samples:
+            return
+        self.latest_distance = float(np.mean(self._epoch_distance_samples))
+        self.latest_reward = float(np.mean(self._epoch_reward_samples))
+        self.latest_entropy = float(np.mean(self._epoch_entropy_samples))
+        self.latest_loss = float(np.mean(self._epoch_loss_samples))
+        self.best_distance = min(self.best_distance, self.latest_distance)
+        self.best_reward = max(self.best_reward, self.latest_reward)
+        self.distance_history.append(self.latest_distance)
+        self.reward_history.append(self.latest_reward)
+        self.entropy_history.append(self.latest_entropy)
+        self.loss_history.append(self.latest_loss)
+
     def greedy_sequence(self) -> List[int]:
         self.model.eval()
         with torch.no_grad():
-            actions, _ = self.model(self.coords, greedy=True)
+            actions, _, _ = self.model(self.coords_single, greedy=True)
         return actions[0].detach().cpu().tolist()
 
     def greedy_eval_metrics(self) -> Tuple[float, float]:
         self.model.eval()
         with torch.no_grad():
-            actions, _ = self.model(self.coords, greedy=True)
+            actions, _, _ = self.model(self.coords_single, greedy=True)
             distance = self._route_distance(actions).mean()
             reward = -distance
         return float(distance.detach().cpu().item()), float(reward.detach().cpu().item())
+
+    def maybe_save_best_policy(self, greedy_distance: float, previous_best_distance: float):
+        if greedy_distance + 1e-9 < previous_best_distance:
+            self.best_policy_state_dict = copy.deepcopy(self.model.state_dict())
+
+    def load_best_policy(self):
+        if self.best_policy_state_dict is not None:
+            self.model.load_state_dict(self.best_policy_state_dict)
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -549,19 +665,175 @@ def render_route_map(
     return fmap
 
 
+def build_training_chart_df(
+    module: "RoutingLightningModule",
+    teaching_mode: bool,
+    smoothing_window: int,
+) -> Optional[pd.DataFrame]:
+    aligned_len = min(
+        len(module.reward_history),
+        len(module.greedy_eval_reward_history),
+        len(module.entropy_history),
+    )
+    if aligned_len == 0:
+        return None
+    sw = max(1, int(smoothing_window))
+    if teaching_mode:
+        history_df = pd.DataFrame(
+            {
+                "greedy_eval_reward": module.greedy_eval_reward_history[:aligned_len],
+                "sampled_episode_reward": module.reward_history[:aligned_len],
+                "policy_entropy_proxy": module.entropy_history[:aligned_len],
+            }
+        )
+    else:
+        history_df = pd.DataFrame(
+            {
+                "sampled_episode_reward": module.reward_history[:aligned_len],
+                "greedy_eval_reward": module.greedy_eval_reward_history[:aligned_len],
+            }
+        )
+    if sw > 1:
+        smooth_df = history_df.rolling(window=sw, min_periods=1).mean()
+        smooth_df.columns = [f"{col}_smooth" for col in smooth_df.columns]
+        history_df = pd.concat([history_df, smooth_df], axis=1)
+    return history_df
+
+
+class TrainingBridge:
+    """Thread-safe snapshot for `st.fragment` live updates (no full-page reruns)."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.done = False
+        self.error: Optional[str] = None
+        self.epoch = 0
+        self.latest_loss = 0.0
+        self.best_sampled_distance_m = float("inf")
+        self.best_greedy_distance_m = float("inf")
+        self.chart_df: Optional[pd.DataFrame] = None
+        self.final_map: Optional[Any] = None
+        self.final_baseline_rows: Optional[List[dict]] = None
+        self.stopped_by_user = False
+
+    def apply_epoch_snapshot(
+        self,
+        epoch_num: int,
+        module: "RoutingLightningModule",
+        teaching_mode: bool,
+        smoothing_window: int,
+    ) -> None:
+        df = build_training_chart_df(module, teaching_mode, smoothing_window)
+        with self.lock:
+            self.epoch = epoch_num
+            self.latest_loss = float(module.latest_loss)
+            self.best_sampled_distance_m = float(module.best_distance)
+            self.best_greedy_distance_m = float(module.best_greedy_eval_distance)
+            self.chart_df = df.copy() if df is not None else None
+
+
+class StopTrainingEventCallback(pl.Callback):
+    def __init__(self, stop_event: threading.Event):
+        super().__init__()
+        self.stop_event = stop_event
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        del pl_module
+        if self.stop_event.is_set():
+            trainer.should_stop = True
+
+
+def _run_training_worker(
+    bridge: TrainingBridge,
+    module: RoutingLightningModule,
+    subset_cache: SubsetGraphCache,
+    epoch_tracker: Dict[str, int],
+    train_loader: DataLoader,
+    max_epochs: int,
+    teaching_mode: bool,
+    smoothing_window: int,
+    baseline_rows: List[dict],
+    optimal_dist: Optional[float],
+    city_name: str,
+) -> None:
+    try:
+        if max_epochs > 0:
+            progress_cb = StreamlitProgressCallback(
+                module=module,
+                subset_cache=subset_cache,
+                epoch_metric_placeholder=None,
+                best_distance_placeholder=None,
+                current_loss_placeholder=None,
+                chart_slot=None,
+                map_slot=None,
+                map_update_interval=1,
+                teaching_mode=teaching_mode,
+                smoothing_window=smoothing_window,
+                epoch_tracker=epoch_tracker,
+                bridge=bridge,
+            )
+            stop_cb = StopTrainingEventCallback(bridge.stop_event)
+            trainer = pl.Trainer(
+                max_epochs=max_epochs,
+                accelerator="cpu",
+                logger=False,
+                enable_checkpointing=False,
+                enable_progress_bar=False,
+                enable_model_summary=False,
+                callbacks=[progress_cb, stop_cb],
+            )
+            trainer.fit(module, train_loader)
+        module.load_best_policy()
+        final_route_indices = module.greedy_sequence()
+        final_distance = route_distance_for_sequence(
+            subset_cache.distance_matrix, final_route_indices
+        )
+        final_reward = -final_distance
+        final_map = render_route_map(
+            city_name=city_name,
+            selected_names=subset_cache.selected_names,
+            selected_coords=subset_cache.selected_coords,
+            path_cache=subset_cache.path_cache,
+            route_indices=final_route_indices,
+        )
+        final_row: dict = {
+            "policy": "trained_greedy",
+            "distance_m": round(final_distance, 2),
+            "reward": round(final_reward, 2),
+        }
+        if optimal_dist is not None:
+            final_row["optimality_gap_%"] = round(
+                100.0 * (final_distance - optimal_dist) / max(1e-9, optimal_dist), 3
+            )
+        full_rows = list(baseline_rows) + [final_row]
+        with bridge.lock:
+            bridge.final_map = final_map
+            bridge.final_baseline_rows = full_rows
+            bridge.stopped_by_user = bridge.stop_event.is_set()
+    except Exception as exc:
+        with bridge.lock:
+            bridge.error = str(exc)
+    finally:
+        with bridge.lock:
+            bridge.done = True
+
+
 class StreamlitProgressCallback(pl.Callback):
     def __init__(
         self,
         module: RoutingLightningModule,
         subset_cache: SubsetGraphCache,
-        epoch_metric_placeholder,
-        best_distance_placeholder,
-        current_loss_placeholder,
-        chart_slot,
-        map_slot,
+        epoch_metric_placeholder: Any,
+        best_distance_placeholder: Any,
+        current_loss_placeholder: Any,
+        chart_slot: Any,
+        map_slot: Any,
         map_update_interval: int,
-        best_known_distance: float,
         teaching_mode: bool,
+        smoothing_window: int,
+        epoch_tracker: Dict[str, int],
+        bridge: Optional[TrainingBridge] = None,
     ):
         super().__init__()
         self.module_ref = module
@@ -572,51 +844,56 @@ class StreamlitProgressCallback(pl.Callback):
         self.chart_slot = chart_slot
         self.map_slot = map_slot
         self.map_update_interval = max(1, map_update_interval)
-        self.best_known_distance = best_known_distance
         self.teaching_mode = teaching_mode
+        self.smoothing_window = max(1, int(smoothing_window))
+        self.epoch_tracker = epoch_tracker
+        self.bridge = bridge
 
     def on_train_epoch_end(self, trainer, pl_module):
         del pl_module
-        epoch_num = trainer.current_epoch + 1
-        self.epoch_metric_placeholder.metric("Current Epoch", epoch_num)
-        self.best_distance_placeholder.metric(
-            "Best Total Route Distance (meters)", f"{self.module_ref.best_distance:,.1f}"
-        )
-        self.current_loss_placeholder.metric(
-            "Current Policy Loss", f"{self.module_ref.latest_loss:.4f}"
-        )
+        self.epoch_tracker["value"] += 1
+        epoch_num = int(self.epoch_tracker["value"])
         greedy_distance, greedy_reward = self.module_ref.greedy_eval_metrics()
         self.module_ref.latest_greedy_eval_distance = greedy_distance
         self.module_ref.latest_greedy_eval_reward = greedy_reward
+        prev_best_greedy = self.module_ref.best_greedy_eval_distance
         self.module_ref.best_greedy_eval_distance = min(
             self.module_ref.best_greedy_eval_distance, greedy_distance
         )
         self.module_ref.best_greedy_eval_reward = max(
             self.module_ref.best_greedy_eval_reward, greedy_reward
         )
+        self.module_ref.maybe_save_best_policy(greedy_distance, prev_best_greedy)
         self.module_ref.greedy_eval_distance_history.append(greedy_distance)
         self.module_ref.greedy_eval_reward_history.append(greedy_reward)
-        self.module_ref.regret_history.append(greedy_distance - self.best_known_distance)
 
-        if self.teaching_mode:
-            history_df = pd.DataFrame(
-                {
-                    "greedy_eval_reward": self.module_ref.greedy_eval_reward_history,
-                    "sampled_episode_reward": self.module_ref.reward_history,
-                    "greedy_regret_m": self.module_ref.regret_history,
-                    "policy_entropy_proxy": self.module_ref.entropy_history,
-                }
+        if self.bridge is not None:
+            self.bridge.apply_epoch_snapshot(
+                epoch_num, self.module_ref, self.teaching_mode, self.smoothing_window
             )
-        else:
-            history_df = pd.DataFrame(
-                {
-                    "sampled_episode_reward": self.module_ref.reward_history,
-                    "greedy_eval_reward": self.module_ref.greedy_eval_reward_history,
-                }
+            return
+
+        if self.epoch_metric_placeholder is not None:
+            self.epoch_metric_placeholder.metric("Current Epoch", epoch_num)
+        if self.best_distance_placeholder is not None:
+            self.best_distance_placeholder.metric(
+                "Best Total Route Distance (meters)", f"{self.module_ref.best_distance:,.1f}"
             )
+        if self.current_loss_placeholder is not None:
+            self.current_loss_placeholder.metric(
+                "Current Policy Loss", f"{self.module_ref.latest_loss:.4f}"
+            )
+
+        history_df = build_training_chart_df(
+            self.module_ref, self.teaching_mode, self.smoothing_window
+        )
+        if history_df is None or self.chart_slot is None:
+            return
         self.chart_slot.line_chart(history_df, width="stretch")
 
-        if epoch_num % self.map_update_interval == 0 or epoch_num == 1:
+        if self.map_slot is not None and (
+            epoch_num % self.map_update_interval == 0 or epoch_num == 1
+        ):
             greedy_indices = self.module_ref.greedy_sequence()
             fmap = render_route_map(
                 city_name=self.subset_cache.city_name,
@@ -625,7 +902,6 @@ class StreamlitProgressCallback(pl.Callback):
                 path_cache=self.subset_cache.path_cache,
                 route_indices=greedy_indices,
             )
-            self.map_slot.empty()
             with self.map_slot.container():
                 st_folium(
                     fmap,
@@ -634,6 +910,102 @@ class StreamlitProgressCallback(pl.Callback):
                     returned_objects=[],
                     key=f"route_map_epoch_{epoch_num}",
                 )
+
+
+@st.fragment(run_every=timedelta(seconds=2))
+def training_progress_fragment() -> None:
+    bridge = st.session_state.get("training_bridge")
+    ctx = st.session_state.get("training_context")
+    if bridge is None:
+        st.caption("Live training curves appear here after you start training.")
+        return
+
+    with bridge.lock:
+        err = bridge.error
+        done = bridge.done
+        epoch = bridge.epoch
+        latest_loss = bridge.latest_loss
+        best_s = bridge.best_sampled_distance_m
+        best_g = bridge.best_greedy_distance_m
+        chart_df = bridge.chart_df.copy() if bridge.chart_df is not None else None
+        final_map = bridge.final_map
+        final_rows = bridge.final_baseline_rows
+        stopped = bridge.stopped_by_user
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current Epoch", epoch if epoch > 0 else "—")
+    c2.metric(
+        "Best sampled distance (m)",
+        f"{best_s:,.1f}" if best_s < float("inf") else "—",
+    )
+    c3.metric("Best greedy distance (m)", f"{best_g:,.1f}" if best_g < float("inf") else "—")
+    c4.metric("Current policy loss", f"{latest_loss:.4f}")
+
+    if err and not done:
+        st.error(err)
+        return
+
+    if chart_df is not None and not chart_df.empty:
+        st.line_chart(chart_df, width="stretch")
+    elif not done:
+        st.caption("Collecting first epoch…")
+
+    if ctx and not done:
+        init_rows = ctx.get("initial_baseline_rows")
+        if init_rows:
+            with st.expander("Baseline policies (fixed)", expanded=False):
+                st.dataframe(pd.DataFrame(init_rows), width="stretch")
+
+    # Hand off final map/table to main() once. Re-rendering st_folium inside this fragment
+    # every `run_every` interval remounts the iframe and causes flicker after training ends.
+    if done and not st.session_state.get("_training_final_handoff_done"):
+        st.session_state["_training_final_handoff_done"] = True
+        if err:
+            st.session_state["post_train_payload"] = {"error": err}
+        elif final_map is not None and final_rows is not None:
+            st.session_state["post_train_payload"] = {
+                "map": final_map,
+                "rows": final_rows,
+                "stopped": stopped,
+            }
+        else:
+            st.session_state["post_train_payload"] = {
+                "error": "Training finished without a complete final map payload.",
+            }
+        st.rerun()
+
+    if done and st.session_state.get("_training_final_handoff_done"):
+        payload = st.session_state.get("post_train_payload") or {}
+        if not payload.get("error"):
+            st.caption(
+                "Final route and comparison table are shown in the static section below (no auto-refresh)."
+            )
+
+
+def render_static_post_train_results() -> None:
+    payload = st.session_state.get("post_train_payload")
+    if not payload:
+        return
+    if payload.get("error"):
+        if not st.session_state.get("_post_train_error_toast_shown"):
+            st.session_state["_post_train_error_toast_shown"] = True
+            st.error(payload["error"])
+        return
+    st.subheader("Final route (best greedy policy)")
+    st_folium(
+        payload["map"],
+        width=1200,
+        height=600,
+        returned_objects=[],
+        key="final_map_static_main",
+    )
+    st.dataframe(pd.DataFrame(payload["rows"]), width="stretch")
+    if not st.session_state.get("_post_train_success_toast_shown"):
+        st.session_state["_post_train_success_toast_shown"] = True
+        if payload.get("stopped"):
+            st.success("Training stopped. Map and table show the best greedy policy so far.")
+        else:
+            st.success("Training complete. Map and table show the best greedy policy.")
 
 
 def main():
@@ -680,37 +1052,67 @@ def main():
             st.session_state["pending_selected_names"] = shuffled_names
             st.rerun()
         embed_dim = st.selectbox("Embedding Dimension", options=[64, 128, 256], index=1)
+        policy_backbone = st.selectbox(
+            "Policy backbone",
+            options=["Transformer", "GRU"],
+            index=0,
+            help="Transformer: set encoder over landmarks. GRU: recurrent encoder over the "
+            "coordinate sequence, same pointer decoder head.",
+        )
         num_layers = st.number_input(
-            "Transformer Layers", min_value=1, max_value=6, value=3, step=1
+            "Encoder depth (Transformer layers or GRU layers)",
+            min_value=1,
+            max_value=6,
+            value=3,
+            step=1,
         )
         learning_rate = st.number_input(
-            "Learning Rate", min_value=0.0001, max_value=0.0100, value=1e-3, format="%.4f"
+            "Learning Rate", min_value=0.000001, max_value=0.100000, value=1e-4, format="%.6f"
         )
-        max_epochs = st.number_input("Training Epochs", min_value=0, max_value=100, value=20)
+        trajectories_per_update = st.number_input(
+            "Trajectories per Update", min_value=1, max_value=256, value=64, step=1
+        )
+        updates_per_epoch = st.number_input(
+            "Updates per Epoch", min_value=1, max_value=100, value=4, step=1
+        )
+        smoothing_window = st.number_input(
+            "Chart Smoothing Window", min_value=1, max_value=50, value=8, step=1
+        )
+        entropy_coef = st.number_input(
+            "Entropy coefficient (regularization)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.01,
+            step=0.005,
+            format="%.4f",
+            help="Adds −λ·H(π) to the loss to encourage exploration (higher = more exploration).",
+        )
+        max_epochs = st.number_input("Training Epochs", min_value=0, max_value=10000, value=500)
 
         can_run = len(selected_names) >= 3
-        train_clicked = st.button("Initialize & Train Policy", disabled=not can_run)
+        bridge = st.session_state.get("training_bridge")
+        ctx = st.session_state.get("training_context")
+        thread = ctx.get("thread") if ctx else None
+        training_in_progress = bool(
+            bridge is not None
+            and ctx is not None
+            and not bridge.done
+            and thread is not None
+            and thread.is_alive()
+        )
+        train_clicked = st.button(
+            "Initialize & Train Policy",
+            disabled=not can_run or training_in_progress,
+            key="btn_train_policy",
+        )
         if not can_run:
             st.info("Select at least 3 landmarks to initialize and train.")
 
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    epoch_metric_placeholder = metric_col1.empty()
-    best_distance_placeholder = metric_col2.empty()
-    current_loss_placeholder = metric_col3.empty()
-    if teaching_mode:
-        st.caption(
-            "Teaching Mode: Greedy reward/regret plus sampled reward and entropy proxy per epoch"
-        )
-    else:
-        st.caption(
-            "Training Progress: Sampled Reward vs Greedy Eval Reward per Epoch (higher is better)"
-        )
-    chart_placeholder = st.empty()
-    map_placeholder = st.empty()
-    baseline_table_placeholder = st.empty()
-
-    if train_clicked and can_run:
-        # Seed from current time so each run has clear stochastic variation.
+    # Start training here (before the live fragment) so a Train click is not lost when
+    # `training_progress_fragment` performs its one-time post-run `st.rerun()` hand-off
+    # while `_training_final_handoff_done` is still unset.
+    train_start = train_clicked and can_run
+    if train_start:
         run_seed = int(time.time_ns() % (2**32 - 1))
         pl.seed_everything(run_seed, workers=True)
         random.seed(run_seed)
@@ -718,7 +1120,7 @@ def main():
         torch.manual_seed(run_seed)
 
         st.info(f"Run seed (time-based): {run_seed}")
-        with st.spinner(f"Building {city_name} graph cache and training policy..."):
+        with st.spinner(f"Building {city_name} graph cache and initializing policy..."):
             subset_cache = build_subset_graph_cache(
                 city_name=city_name,
                 selected_names=selected_names,
@@ -740,21 +1142,23 @@ def main():
             optimal_seq, optimal_dist = brute_force_optimal_sequence(subset_cache.distance_matrix)
             optimal_reward = -optimal_dist if optimal_dist is not None else None
 
+            backbone_key: Literal["transformer", "gru"] = (
+                "gru" if policy_backbone == "GRU" else "transformer"
+            )
             module = RoutingLightningModule(
                 coords=subset_cache.selected_coords,
                 distance_matrix=subset_cache.distance_matrix,
                 embed_dim=int(embed_dim),
                 num_layers=int(num_layers),
                 learning_rate=float(learning_rate),
+                trajectories_per_update=int(trajectories_per_update),
+                entropy_coef=float(entropy_coef),
+                policy_backbone=backbone_key,
             )
 
             untrained_seq = module.greedy_sequence()
             untrained_dist = route_distance_for_sequence(subset_cache.distance_matrix, untrained_seq)
             untrained_reward = -untrained_dist
-
-            best_known_distance = (
-                optimal_dist if optimal_dist is not None else min(random_dist, nn_dist, untrained_dist)
-            )
 
             baseline_rows = [
                 {
@@ -784,71 +1188,86 @@ def main():
             else:
                 baseline_rows.append(
                     {
-                        "policy": "exact_optimal",
-                        "distance_m": "N>9 skipped",
-                        "reward": "N>9 skipped",
+                        "policy": "exact_optimal (N>9, not enumerated)",
+                        # Keep numeric dtypes so Arrow-backed tables (e.g. st.dataframe) do not fail
+                        # on mixed str/float columns.
+                        "distance_m": math.nan,
+                        "reward": math.nan,
                     }
                 )
-            baseline_table_placeholder.dataframe(pd.DataFrame(baseline_rows), width="stretch")
 
-            callback = StreamlitProgressCallback(
-                module=module,
-                subset_cache=subset_cache,
-                epoch_metric_placeholder=epoch_metric_placeholder,
-                best_distance_placeholder=best_distance_placeholder,
-                current_loss_placeholder=current_loss_placeholder,
-                chart_slot=chart_placeholder,
-                map_slot=map_placeholder,
-                map_update_interval=len(selected_names),
-                best_known_distance=best_known_distance,
-                teaching_mode=teaching_mode,
-            )
-            trainer = pl.Trainer(
-                max_epochs=int(max_epochs),
-                accelerator="cpu",
-                logger=False,
-                enable_checkpointing=False,
-                enable_progress_bar=False,
-                enable_model_summary=False,
-                callbacks=[callback],
-            )
-            train_loader = DataLoader(_SingleInstanceDataset(), batch_size=1, shuffle=False)
-            trainer.fit(module, train_loader)
+        max_epochs_int = int(max_epochs)
+        st.session_state.pop("training_bridge", None)
+        st.session_state.pop("training_context", None)
+        st.session_state.pop("post_train_payload", None)
+        st.session_state.pop("_training_final_handoff_done", None)
+        st.session_state.pop("_post_train_success_toast_shown", None)
+        st.session_state.pop("_post_train_error_toast_shown", None)
 
-            # Always render the final optimized greedy route after training ends.
-            final_route_indices = module.greedy_sequence()
-            final_distance = route_distance_for_sequence(subset_cache.distance_matrix, final_route_indices)
-            final_reward = -final_distance
-            final_map = render_route_map(
-                city_name=city_name,
-                selected_names=subset_cache.selected_names,
-                selected_coords=subset_cache.selected_coords,
-                path_cache=subset_cache.path_cache,
-                route_indices=final_route_indices,
-            )
-            map_placeholder.empty()
-            with map_placeholder.container():
-                st_folium(
-                    final_map,
-                    width=1200,
-                    height=600,
-                    returned_objects=[],
-                    key="route_map_final",
-                )
+        bridge = TrainingBridge()
+        epoch_tracker: Dict[str, int] = {"value": 0}
+        train_loader = DataLoader(
+            _FixedLengthDataset(length=int(updates_per_epoch)),
+            batch_size=1,
+            shuffle=False,
+        )
+        worker_args = (
+            bridge,
+            module,
+            subset_cache,
+            epoch_tracker,
+            train_loader,
+            max_epochs_int,
+            teaching_mode,
+            int(smoothing_window),
+            copy.deepcopy(baseline_rows),
+            optimal_dist,
+            city_name,
+        )
+        train_thread = threading.Thread(target=_run_training_worker, args=worker_args, daemon=True)
+        st.session_state["training_bridge"] = bridge
+        st.session_state["training_context"] = {
+            "thread": train_thread,
+            "module": module,
+            "subset_cache": subset_cache,
+            "city_name": city_name,
+            "initial_baseline_rows": copy.deepcopy(baseline_rows),
+        }
+        train_thread.start()
 
-            final_row = {
-                "policy": "trained_greedy",
-                "distance_m": round(final_distance, 2),
-                "reward": round(final_reward, 2),
-            }
-            if optimal_dist is not None:
-                final_row["optimality_gap_%"] = round(
-                    100.0 * (final_distance - optimal_dist) / max(1e-9, optimal_dist), 3
-                )
-            baseline_rows.append(final_row)
-            baseline_table_placeholder.dataframe(pd.DataFrame(baseline_rows), width="stretch")
+    if teaching_mode:
+        st.caption(
+            "Teaching Mode: Greedy reward, sampled reward, and entropy proxy per epoch"
+        )
+    else:
+        st.caption(
+            "Training Progress: Sampled Reward vs Greedy Eval Reward per Epoch (higher is better)"
+        )
+    st.caption(
+        "Live curves refresh inside the panel below every ~2s without reloading the whole page."
+    )
+    # Stop must render here (not in the sidebar): the sidebar runs before `train_start`, so an
+    # active thread does not exist yet when sidebar widgets are drawn on the same run as Train.
+    bridge_live = st.session_state.get("training_bridge")
+    ctx_live = st.session_state.get("training_context")
+    th_live = ctx_live.get("thread") if ctx_live else None
+    training_active = bool(
+        bridge_live is not None
+        and ctx_live is not None
+        and not bridge_live.done
+        and th_live is not None
+        and th_live.is_alive()
+    )
+    if training_active:
+        s1, s2 = st.columns([1, 4])
+        with s1:
+            if st.button("Stop training", key="btn_stop_training_main"):
+                bridge_live.stop_event.set()
+        with s2:
+            st.caption("Policy training is running. Stop ends after the current epoch boundary.")
 
-        st.success("Training complete. The map shows the current greedy policy route.")
+    training_progress_fragment()
+    render_static_post_train_results()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Macro-Action City Tour Routing (RL + Attention)
 
-This project is a pedagogical reinforcement learning app that frames city walking-tour planning as a sequence decision problem (TSP-style) and optimizes route order with a Transformer-based pointer policy trained by REINFORCE.
+This project is a pedagogical reinforcement learning app that frames city walking-tour planning as a sequence decision problem (TSP-style) and optimizes route order with a pointer policy (Transformer or GRU encoder over landmark coordinates) trained by REINFORCE.
 
 The app combines:
 - **Geospatial realism** from OpenStreetMap (`osmnx` + `networkx`)
@@ -99,9 +99,12 @@ Therefore:
 
 ---
 
-## 4) Policy Network: Attention Pointer Model
+## 4) Policy Network: Pointer Model (Transformer or GRU)
 
-The policy is `RoutingAttentionModel`, a Transformer encoder + attention decoder (pointer-style).
+The policy uses a shared **pointer-style decoder** (context query vs.\ per-node keys). The **encoder** is chosen in the sidebar:
+
+- **`RoutingAttentionModel`:** `nn.TransformerEncoder` over the sequence of landmark embeddings.
+- **`RoutingGRUModel`:** `nn.GRU` over the same coordinate sequence (order is the landmark list in the UI), then the same decoder head.
 
 ### 4.1 Encoder
 
@@ -111,10 +114,13 @@ Given coordinate matrix \(X \in \mathbb{R}^{N\times 2}\):
 \[
 E = XW_e + b_e,\quad E\in\mathbb{R}^{N\times d}
 \]
-2. Transformer encoder:
+2. Sequence encoder (one of):
 \[
-H = \text{TransformerEncoder}(E),\quad H=[h_1,\dots,h_N],\ h_i\in\mathbb{R}^d
+H = \text{TransformerEncoder}(E)
+\quad\text{or}\quad
+H = \text{GRU}(E)\ \text{(final layer outputs, batch-first)}
 \]
+with \(H=[h_1,\dots,h_N]\), \(h_i\in\mathbb{R}^d\).
 3. Global graph embedding:
 \[
 \bar{h} = \frac{1}{N}\sum_{i=1}^{N} h_i
@@ -154,28 +160,22 @@ For map display, greedy decoding uses \(\arg\max_i u_{t,i}^*\).
 
 ---
 
-## 5) Optimization: REINFORCE with EMA Baseline
+## 5) Optimization: REINFORCE with Greedy Self-Baseline
 
 Training is implemented in `RoutingLightningModule.training_step`.
 
-For one rollout:
-1. Sample full sequence \(A_{1:N}\) and log-probabilities \(\log \pi_\theta(A_t|S_t)\)
-2. Compute reward \(r\) from the cached distance matrix
-3. Update exponential moving-average baseline:
+For one update:
+1. Sample \(K\) full sequences from \(\pi_\theta\) and collect \(\log \pi_\theta(A_t|S_t)\).
+2. Compute per-trajectory rewards \(r^{(i)} = -\mathrm{length}(\mathrm{tour}_i)\) from the cached distance matrix.
+3. Run a **greedy** decode from the same \(\theta\) on the same coordinates to obtain \(r_{\mathrm{greedy}}(\theta)\) (computed under `torch.no_grad()` so it acts only as a baseline signal).
+4. Advantage \(\hat{A}^{(i)} = r^{(i)} - r_{\mathrm{greedy}}(\theta)\).
+5. REINFORCE loss (macro-action factorization):
 \[
-b_t = \beta b_{t-1} + (1-\beta)\,r_t,\quad \beta=0.9
+\mathcal{L}(\theta)= -\frac{1}{K}\sum_{i=1}^{K}\hat{A}^{(i)} \sum_{t=1}^{N}\log\pi_\theta\!\left(A^{(i)}_t\mid S^{(i)}_t\right)
 \]
-4. Advantage:
-\[
-\hat{A}_t = r_t - b_t
-\]
-5. REINFORCE loss:
-\[
-\mathcal{L}(\theta)= -\hat{A}_t \sum_{k=1}^{N}\log\pi_\theta(A_k\mid S_k)
-\]
-6. Optimize with Adam.
+6. Add \(-\lambda H(\pi)\) for entropy regularization (sidebar coefficient) and optimize with Adam.
 
-This baseline reduces gradient variance while preserving unbiased policy-gradient direction.
+This **greedy self-baseline** correlates strongly with the current policy and typically lowers gradient variance compared to a slow global scalar baseline, at the cost of one extra forward pass per update.
 
 ---
 
@@ -188,7 +188,8 @@ This baseline reduces gradient variance while preserving unbiased policy-gradien
 - Teaching Mode toggle
 - Scenario preset selector (`Custom`, `Easy`, `Medium`, `Hard`) per city
 - Embedding dimension (`64`, `128`, `256`)
-- Transformer layers (`1` to `6`)
+- Policy backbone (`Transformer` or `GRU`)
+- Encoder depth: Transformer layers or GRU layers (`1` to `6`)
 - Learning rate
 - Training epochs
 - Button: **Initialize & Train Policy**
@@ -200,7 +201,7 @@ This baseline reduces gradient variance while preserving unbiased policy-gradien
   - Current Policy Loss
 - Progress chart:
   - Standard mode: sampled reward + greedy-eval reward
-  - Teaching mode: sampled reward, greedy reward, greedy regret (meters), entropy proxy
+  - Teaching mode: sampled reward, greedy reward, entropy proxy
 - Baseline comparison table:
   - random
   - nearest neighbor (`start=0`)
@@ -256,7 +257,7 @@ streamlit run app.py
 - **Important decoding caveat:** greedy decoding uses `torch.argmax` on logits. If multiple logits are tied (or numerically near-tied), `argmax` selects the first maximal index. This deterministic tie-breaking can introduce an index-order bias.
 - If selected landmarks are already ordered in a geographically sensible sequence (for example, roughly monotonic by latitude/longitude), first-index tie-breaking can produce a surprisingly good untrained greedy route. This can make "epoch 0" look better than expected even without meaningful learning.
 - For demonstrations, use shuffled landmark order, baseline comparisons (random / nearest-neighbor / untrained / trained), and optimality-gap reporting to avoid over-attributing improvements to RL.
-- In Teaching Mode, focus on **regret** and **baseline gaps** rather than only raw sampled reward, because REINFORCE reward traces are high-variance.
+- In Teaching Mode, focus on **baseline gaps** and entropy trends rather than only raw sampled reward, because REINFORCE reward traces are high-variance.
 
 ---
 
