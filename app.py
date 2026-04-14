@@ -160,6 +160,57 @@ CITY_CONFIGS = {
             ],
         },
     },
+    "Rio": {
+        "bbox": (-43.3200, -23.1000, -43.0800, -22.8300),
+        "landmarks": {
+            "Christ the Redeemer": (-22.9519, -43.2105),
+            "Sugarloaf Mountain": (-22.9486, -43.1565),
+            "Copacabana Beach": (-22.9711, -43.1822),
+            "Ipanema Beach": (-22.9868, -43.1994),
+            "Arpoador": (-22.9892, -43.1936),
+            "Parque Lage": (-22.9596, -43.2110),
+            "Jardim Botânico": (-22.9678, -43.2243),
+            "Rodrigo de Freitas Lagoon": (-22.9710, -43.2036),
+            "Maracanã Stadium": (-22.9120, -43.2302),
+            "Selarón Steps": (-22.9150, -43.1793),
+            "Metropolitan Cathedral of Rio": (-22.9106, -43.1807),
+            "Municipal Theater": (-22.9089, -43.1758),
+            "Candelária Church": (-22.9010, -43.1777),
+            "Museum of Tomorrow": (-22.8958, -43.1796),
+            "Fort Copacabana": (-22.9847, -43.1905),
+            "Botafogo Bay (viewpoint)": (-22.9480, -43.1800),
+            "São Bento Monastery": (-22.8988, -43.1759),
+            "Arcos da Lapa": (-22.9153, -43.1756),
+            "Flamengo Park": (-22.9170, -43.1720),
+            "Gloria Marina": (-22.9180, -43.1680),
+        },
+        "presets": {
+            "Custom": [],
+            "Easy (3 landmarks)": [
+                "Christ the Redeemer",
+                "Sugarloaf Mountain",
+                "Copacabana Beach",
+            ],
+            "Medium (6 landmarks)": [
+                "Copacabana Beach",
+                "Ipanema Beach",
+                "Arpoador",
+                "Parque Lage",
+                "Jardim Botânico",
+                "Rodrigo de Freitas Lagoon",
+            ],
+            "Hard (8 landmarks)": [
+                "Museum of Tomorrow",
+                "Candelária Church",
+                "Selarón Steps",
+                "Maracanã Stadium",
+                "Metropolitan Cathedral of Rio",
+                "Flamengo Park",
+                "Sugarloaf Mountain",
+                "Christ the Redeemer",
+            ],
+        },
+    },
 }
 
 
@@ -188,6 +239,12 @@ WIKIPEDIA_TITLE_OVERRIDES = {
     "Paris": {
         "Sacre-Coeur": "Sacré-Cœur, Paris",
         "Bastille": "Place de la Bastille",
+    },
+    "Rio": {
+        "Selarón Steps": "Escadaria Selarón",
+        "Metropolitan Cathedral of Rio": "Rio de Janeiro Cathedral",
+        "Museum of Tomorrow": "Museum of Tomorrow (Rio de Janeiro)",
+        "Jardim Botânico": "Rio de Janeiro Botanical Garden",
     },
 }
 

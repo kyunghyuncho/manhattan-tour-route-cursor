@@ -21,6 +21,7 @@ Currently supported city configurations:
 - **Manhattan**
 - **London**
 - **Paris**
+- **Rio** (Rio de Janeiro, Brazil)
 
 Each city provides:
 - its own bounding box for graph extraction
@@ -181,7 +182,7 @@ For one update:
 ## 6) Streamlit Interface Behavior
 
 ### Sidebar
-- City selector (`Manhattan`, `London`, `Paris`)
+- City selector (`Manhattan`, `London`, `Paris`, `Rio`)
 - Landmark multiselect (minimum 3)
 - Shuffle button for selected landmark order
 - Teaching Mode toggle
