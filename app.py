@@ -514,19 +514,25 @@ class RoutingGRUModel(nn.Module):
         self.embed_dim = embed_dim
         self.input_projection = nn.Linear(2, embed_dim)
         nl = max(1, int(num_layers))
-        self.gru = nn.GRU(
-            input_size=embed_dim,
-            hidden_size=embed_dim,
-            num_layers=nl,
-            batch_first=True,
-            dropout=0.0,
+        self.gru_layers = nn.ModuleList(
+            [
+                nn.GRU(
+                    input_size=embed_dim,
+                    hidden_size=embed_dim,
+                    num_layers=1,
+                    batch_first=True,
+                    dropout=0.0,
+                )
+                for _ in range(nl)
+            ]
         )
         self.query_projection = nn.Linear(embed_dim * 2, embed_dim, bias=False)
         self.key_projection = nn.Linear(embed_dim, embed_dim, bias=False)
         _init_pointer_projection_linears(
             self.input_projection, self.query_projection, self.key_projection
         )
-        _init_gru_weights(self.gru)
+        for gru in self.gru_layers:
+            _init_gru_weights(gru)
 
     def _decode_logits(
         self, node_embeddings: torch.Tensor, visited_mask: torch.Tensor, prev_index: torch.Tensor
@@ -547,7 +553,11 @@ class RoutingGRUModel(nn.Module):
         self, coords: torch.Tensor, greedy: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.input_projection(coords)
-        node_embeddings, _ = self.gru(x)
+        node_embeddings = x
+        for gru in self.gru_layers:
+            gru_out, _ = gru(node_embeddings)
+            # Residual connection across GRU layers to stabilize deep recurrent stacks.
+            node_embeddings = gru_out + node_embeddings
         batch_size, num_nodes, _ = node_embeddings.shape
         visited = torch.zeros(batch_size, num_nodes, dtype=torch.bool, device=coords.device)
         prev_index = torch.zeros(batch_size, dtype=torch.long, device=coords.device)
@@ -706,6 +716,19 @@ class RoutingLightningModule(pl.LightningModule):
             reward = -distance
         return float(distance.detach().cpu().item()), float(reward.detach().cpu().item())
 
+    def greedy_eval_snapshot(self) -> Tuple[float, float, List[int]]:
+        self.model.eval()
+        with torch.no_grad():
+            actions, _, _ = self.model(self.coords_single, greedy=True)
+            distance = self._route_distance(actions).mean()
+            reward = -distance
+        route_indices = actions[0].detach().cpu().tolist()
+        return (
+            float(distance.detach().cpu().item()),
+            float(reward.detach().cpu().item()),
+            route_indices,
+        )
+
     def maybe_save_best_policy(self, greedy_distance: float, previous_best_distance: float):
         if greedy_distance + 1e-9 < previous_best_distance:
             self.best_policy_state_dict = copy.deepcopy(self.model.state_dict())
@@ -795,6 +818,41 @@ def build_training_chart_df(
     return history_df
 
 
+def select_diverse_greedy_checkpoints(
+    snapshots: List[dict], max_checkpoints: int = 5
+) -> List[dict]:
+    """Pick a small, reward-diverse subset of epoch snapshots for teaching."""
+    if not snapshots:
+        return []
+    if len(snapshots) <= max_checkpoints:
+        return sorted(snapshots, key=lambda x: int(x["epoch"]))
+
+    ranked = sorted(snapshots, key=lambda x: float(x["greedy_reward"]))
+    rank_positions = np.linspace(0, len(ranked) - 1, num=max_checkpoints)
+    chosen_rank_idx = sorted({int(round(pos)) for pos in rank_positions})
+    chosen_epochs = set()
+    selected: List[dict] = []
+    for idx in chosen_rank_idx:
+        snap = ranked[idx]
+        epoch = int(snap["epoch"])
+        if epoch in chosen_epochs:
+            continue
+        selected.append(snap)
+        chosen_epochs.add(epoch)
+
+    if len(selected) < max_checkpoints:
+        for snap in ranked:
+            epoch = int(snap["epoch"])
+            if epoch in chosen_epochs:
+                continue
+            selected.append(snap)
+            chosen_epochs.add(epoch)
+            if len(selected) >= max_checkpoints:
+                break
+
+    return sorted(selected, key=lambda x: int(x["epoch"]))
+
+
 class TrainingBridge:
     """Thread-safe snapshot for `st.fragment` live updates (no full-page reruns)."""
 
@@ -810,6 +868,7 @@ class TrainingBridge:
         self.chart_df: Optional[pd.DataFrame] = None
         self.final_map: Optional[Any] = None
         self.final_baseline_rows: Optional[List[dict]] = None
+        self.final_checkpoint_payloads: Optional[List[dict]] = None
         self.stopped_by_user = False
 
     def apply_epoch_snapshot(
@@ -879,6 +938,8 @@ def _run_training_worker(
                 callbacks=[progress_cb, stop_cb],
             )
             trainer.fit(module, train_loader)
+        else:
+            progress_cb = None
         module.load_best_policy()
         final_route_indices = module.greedy_sequence()
         final_distance = route_distance_for_sequence(
@@ -902,9 +963,34 @@ def _run_training_worker(
                 100.0 * (final_distance - optimal_dist) / max(1e-9, optimal_dist), 3
             )
         full_rows = list(baseline_rows) + [final_row]
+        selected_checkpoints: List[dict] = []
+        if progress_cb is not None:
+            selected_checkpoints = select_diverse_greedy_checkpoints(
+                progress_cb.greedy_snapshots, max_checkpoints=5
+            )
+        checkpoint_payloads = []
+        for cp in selected_checkpoints:
+            cp_route = list(cp["route_indices"])
+            cp_map = render_route_map(
+                city_name=city_name,
+                selected_names=subset_cache.selected_names,
+                selected_coords=subset_cache.selected_coords,
+                path_cache=subset_cache.path_cache,
+                route_indices=cp_route,
+            )
+            checkpoint_payloads.append(
+                {
+                    "epoch": int(cp["epoch"]),
+                    "greedy_distance_m": round(float(cp["greedy_distance_m"]), 2),
+                    "greedy_reward": round(float(cp["greedy_reward"]), 2),
+                    "route_indices": cp_route,
+                    "map": cp_map,
+                }
+            )
         with bridge.lock:
             bridge.final_map = final_map
             bridge.final_baseline_rows = full_rows
+            bridge.final_checkpoint_payloads = checkpoint_payloads
             bridge.stopped_by_user = bridge.stop_event.is_set()
     except Exception as exc:
         with bridge.lock:
@@ -943,12 +1029,13 @@ class StreamlitProgressCallback(pl.Callback):
         self.smoothing_window = max(1, int(smoothing_window))
         self.epoch_tracker = epoch_tracker
         self.bridge = bridge
+        self.greedy_snapshots: List[dict] = []
 
     def on_train_epoch_end(self, trainer, pl_module):
         del pl_module
         self.epoch_tracker["value"] += 1
         epoch_num = int(self.epoch_tracker["value"])
-        greedy_distance, greedy_reward = self.module_ref.greedy_eval_metrics()
+        greedy_distance, greedy_reward, greedy_indices = self.module_ref.greedy_eval_snapshot()
         self.module_ref.latest_greedy_eval_distance = greedy_distance
         self.module_ref.latest_greedy_eval_reward = greedy_reward
         prev_best_greedy = self.module_ref.best_greedy_eval_distance
@@ -961,6 +1048,14 @@ class StreamlitProgressCallback(pl.Callback):
         self.module_ref.maybe_save_best_policy(greedy_distance, prev_best_greedy)
         self.module_ref.greedy_eval_distance_history.append(greedy_distance)
         self.module_ref.greedy_eval_reward_history.append(greedy_reward)
+        self.greedy_snapshots.append(
+            {
+                "epoch": epoch_num,
+                "greedy_distance_m": float(greedy_distance),
+                "greedy_reward": float(greedy_reward),
+                "route_indices": list(greedy_indices),
+            }
+        )
 
         if self.bridge is not None:
             self.bridge.apply_epoch_snapshot(
@@ -989,7 +1084,6 @@ class StreamlitProgressCallback(pl.Callback):
         if self.map_slot is not None and (
             epoch_num % self.map_update_interval == 0 or epoch_num == 1
         ):
-            greedy_indices = self.module_ref.greedy_sequence()
             fmap = render_route_map(
                 city_name=self.subset_cache.city_name,
                 selected_names=self.subset_cache.selected_names,
@@ -1025,6 +1119,11 @@ def training_progress_fragment() -> None:
         chart_df = bridge.chart_df.copy() if bridge.chart_df is not None else None
         final_map = bridge.final_map
         final_rows = bridge.final_baseline_rows
+        final_checkpoints = (
+            copy.deepcopy(bridge.final_checkpoint_payloads)
+            if bridge.final_checkpoint_payloads is not None
+            else None
+        )
         stopped = bridge.stopped_by_user
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1061,6 +1160,7 @@ def training_progress_fragment() -> None:
             st.session_state["post_train_payload"] = {
                 "map": final_map,
                 "rows": final_rows,
+                "checkpoints": final_checkpoints or [],
                 "stopped": stopped,
             }
         else:
@@ -1073,7 +1173,7 @@ def training_progress_fragment() -> None:
         payload = st.session_state.get("post_train_payload") or {}
         if not payload.get("error"):
             st.caption(
-                "Final route and comparison table are shown in the static section below (no auto-refresh)."
+                "Post-training summary and checkpoint route explorer are shown below (no auto-refresh)."
             )
 
 
@@ -1086,15 +1186,79 @@ def render_static_post_train_results() -> None:
             st.session_state["_post_train_error_toast_shown"] = True
             st.error(payload["error"])
         return
-    st.subheader("Final route (best greedy policy)")
-    st_folium(
-        payload["map"],
-        width=1200,
-        height=600,
-        returned_objects=[],
-        key="final_map_static_main",
-    )
-    st.dataframe(pd.DataFrame(payload["rows"]), width="stretch")
+    st.subheader("Post-training results")
+    summary_tab, map_tab = st.tabs(["Summary", "Route Explorer (Map)"])
+    with summary_tab:
+        st.markdown("**Final route (best greedy policy): comparison table**")
+        st.dataframe(pd.DataFrame(payload["rows"]), width="stretch")
+
+    with map_tab:
+        checkpoints = payload.get("checkpoints") or []
+        if checkpoints:
+            options = ["Final (best greedy)"] + [f"Epoch {int(cp['epoch'])}" for cp in checkpoints]
+            if "checkpoint_route_selector" not in st.session_state:
+                st.session_state["checkpoint_route_selector"] = 0
+            selected_idx = int(st.session_state.get("checkpoint_route_selector", 0))
+            nav_left, nav_center, nav_right = st.columns([1, 6, 1])
+            with nav_left:
+                if st.button("<", key="btn_checkpoint_prev", disabled=selected_idx <= 0):
+                    selected_idx = max(0, selected_idx - 1)
+                    st.session_state["checkpoint_route_selector"] = selected_idx
+            with nav_right:
+                if st.button(">", key="btn_checkpoint_next", disabled=selected_idx >= len(options) - 1):
+                    selected_idx = min(len(options) - 1, selected_idx + 1)
+                    st.session_state["checkpoint_route_selector"] = selected_idx
+            with nav_center:
+                selected_idx = st.slider(
+                "Checkpoint snapshot index",
+                min_value=0,
+                max_value=len(options) - 1,
+                value=selected_idx,
+                key="checkpoint_route_selector",
+                help="Move through saved checkpoints (0 is final best greedy route).",
+                )
+            st.caption(f"Selected snapshot: **{options[selected_idx]}**")
+            if selected_idx == 0:
+                final_row = next(
+                    (row for row in payload["rows"] if row.get("policy") == "trained_greedy"),
+                    None,
+                )
+                if final_row is not None:
+                    c1, c2 = st.columns(2)
+                    c1.metric("Final greedy distance (m)", f"{float(final_row['distance_m']):,.2f}")
+                    c2.metric("Final greedy reward", f"{float(final_row['reward']):,.2f}")
+                st_folium(
+                    payload["map"],
+                    width=1200,
+                    height=600,
+                    returned_objects=[],
+                    key="final_map_static_main",
+                )
+            else:
+                selected_cp = checkpoints[selected_idx - 1]
+                c1, c2 = st.columns(2)
+                c1.metric("Checkpoint greedy distance (m)", f"{selected_cp['greedy_distance_m']:,.2f}")
+                c2.metric("Checkpoint greedy reward", f"{selected_cp['greedy_reward']:,.2f}")
+                st_folium(
+                    selected_cp["map"],
+                    width=1200,
+                    height=600,
+                    returned_objects=[],
+                    key=f"checkpoint_map_epoch_{int(selected_cp['epoch'])}",
+                )
+                st.caption(
+                    "Checkpoint route indices: "
+                    + " -> ".join(str(int(idx)) for idx in selected_cp["route_indices"])
+                )
+        else:
+            st.caption("No checkpoint snapshots are available for this run.")
+            st_folium(
+                payload["map"],
+                width=1200,
+                height=600,
+                returned_objects=[],
+                key="final_map_static_main",
+            )
     if not st.session_state.get("_post_train_success_toast_shown"):
         st.session_state["_post_train_success_toast_shown"] = True
         if payload.get("stopped"):
@@ -1298,6 +1462,7 @@ def main():
         st.session_state.pop("_training_final_handoff_done", None)
         st.session_state.pop("_post_train_success_toast_shown", None)
         st.session_state.pop("_post_train_error_toast_shown", None)
+        st.session_state.pop("checkpoint_route_selector", None)
 
         bridge = TrainingBridge()
         epoch_tracker: Dict[str, int] = {"value": 0}

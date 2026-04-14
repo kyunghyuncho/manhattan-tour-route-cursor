@@ -208,12 +208,14 @@ For one update:
   - untrained greedy
   - exact optimal (for \(N \le 9\), otherwise skipped)
   - trained greedy (added after optimization)
-- Folium map:
+- Post-training tabs:
+  - **Summary** tab: final baseline comparison table
+  - **Route Explorer (Map)** tab: final best route plus a small set of reward-diverse greedy checkpoints
+- Folium map behavior:
   - Landmarks shown with numbered markers
   - Marker numbers correspond to **visit order**
   - Marker popup includes image, short description, and Wikipedia link
   - Route segments drawn from `PATH_CACHE` as red street-following polylines
-  - Final optimized route is always rendered when training ends
 
 ---
 
