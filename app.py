@@ -1329,7 +1329,7 @@ def main():
             "Learning Rate", min_value=0.000001, max_value=0.100000, value=1e-4, format="%.6f"
         )
         trajectories_per_update = st.number_input(
-            "Trajectories per Update", min_value=1, max_value=256, value=64, step=1
+            "Trajectories per Update", min_value=1, max_value=256, value=256, step=1
         )
         updates_per_epoch = st.number_input(
             "Updates per Epoch", min_value=1, max_value=100, value=1, step=1
@@ -1346,7 +1346,7 @@ def main():
             format="%.4f",
             help="Adds −λ·H(π) to the loss to encourage exploration (higher = more exploration).",
         )
-        max_epochs = st.number_input("Training Epochs", min_value=0, max_value=10000, value=500)
+        max_epochs = st.number_input("Training Epochs", min_value=0, max_value=10000, value=5000)
 
         can_run = len(selected_names) >= 3
         bridge = st.session_state.get("training_bridge")
